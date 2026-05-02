@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pth.tar
+*.log
+.DS_Store
+output/
+tensorboard/
+data/
+pretrained_models/
+.vscode/
