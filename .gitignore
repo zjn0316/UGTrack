@@ -4,10 +4,10 @@ __pycache__/
 *.pth.tar
 *.log
 .DS_Store
-output/
-tensorboard/
-data/
-pretrained_models/
+/output/
+/tensorboard/
+/data/
+/pretrained_models/
 .vscode/
 autodl/
 操作手册.md

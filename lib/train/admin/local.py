@@ -3,7 +3,7 @@ import os
 
 class EnvironmentSettings:
     def __init__(self):
-        project_root = '/home/zjn/UGTrack'
+        project_root = '/home/zjn/OSTrack'
 
         # EN: Use paths relative to the repository root for Linux portability.
         # 中文：使用仓库根目录相对路径，避免 Linux 环境依赖 Windows 盘符。
@@ -11,6 +11,8 @@ class EnvironmentSettings:
         self.tensorboard_dir = os.path.join(project_root, "tensorboard")    # Directory for tensorboard files.
         self.pretrained_networks = os.path.join(project_root, "pretrained_models")
         self.otb100_uwb_dir = os.path.join(project_root, "data", "OTB100_UWB")
+        self.custom_dataset_dir = os.path.join(project_root, "data", "CustomDataset")
+        self.uav123_uwb_dir = os.path.join(project_root, "data", "UAV123_UWB")
         self.lasot_dir = ''
         self.got10k_dir = ''
         self.got10k_val_dir = ''

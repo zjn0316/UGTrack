@@ -10,3 +10,5 @@ from .imagenetvid_lmdb import ImagenetVID_lmdb
 from .coco_seq_lmdb import MSCOCOSeq_lmdb
 from .tracking_net_lmdb import TrackingNet_lmdb
 from .otb100_uwb import OTB100UWB
+from .custom_dataset import CustomDataset
+from .uav123_uwb import UAV123UWB

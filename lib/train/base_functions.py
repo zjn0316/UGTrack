@@ -1,7 +1,7 @@
 import torch
 from torch.utils.data.distributed import DistributedSampler
 # datasets related
-from lib.train.dataset import Lasot, Got10k, MSCOCOSeq, ImagenetVID, TrackingNet, OTB100UWB
+from lib.train.dataset import Lasot, Got10k, MSCOCOSeq, ImagenetVID, TrackingNet, OTB100UWB, CustomDataset, UAV123UWB
 from lib.train.dataset import Lasot_lmdb, Got10k_lmdb, MSCOCOSeq_lmdb, ImagenetVID_lmdb, TrackingNet_lmdb
 from lib.train.data import sampler, opencv_loader, processing, LTRLoader
 from lib.train.data.loader import resolve_num_workers
@@ -39,7 +39,7 @@ def names2datasets(name_list: list, settings, image_loader):
     for name in name_list:
         # 限定支持的数据集名称范围，避免拼写或配置错误。
         assert name in ["LASOT", "GOT10K_vottrain", "GOT10K_votval", "GOT10K_train_full", "GOT10K_official_val",
-                        "COCO17", "VID", "TRACKINGNET", "OTB100_UWB"]
+                        "COCO17", "VID", "TRACKINGNET", "OTB100_UWB", "CUSTOM_DATASET", "UAV123_UWB"], "Unsupported dataset name '%s'" % name
         if name == "LASOT":
             if settings.use_lmdb:
                 print("Building lasot dataset from lmdb")
@@ -90,6 +90,10 @@ def names2datasets(name_list: list, settings, image_loader):
                 datasets.append(TrackingNet(settings.env.trackingnet_dir, image_loader=image_loader))
         if name == "OTB100_UWB":
             datasets.append(OTB100UWB(settings.env.otb100_uwb_dir, split='train', image_loader=image_loader))
+        if name == "CUSTOM_DATASET":
+            datasets.append(CustomDataset(settings.env.custom_dataset_dir, split='train', image_loader=image_loader))
+        if name == "UAV123_UWB":
+            datasets.append(UAV123UWB(settings.env.uav123_uwb_dir, split='train', image_loader=image_loader))
     return datasets
 
 
