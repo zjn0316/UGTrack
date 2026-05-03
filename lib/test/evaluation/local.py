@@ -6,7 +6,7 @@ from lib.test.evaluation.environment import EnvSettings
 def local_env_settings():
     settings = EnvSettings()
 
-    project_root = '/home/zjn/UGTrack'
+    project_root = '/home/zjn/OSTrack'
     output_root = os.path.join(project_root, "output")
 
     # EN: Use repository-relative paths so tests run on Linux without Windows drive letters.
@@ -18,6 +18,8 @@ def local_env_settings():
     settings.segmentation_path = os.path.join(output_root, "test", "segmentation_results")
     settings.network_path = os.path.join(output_root, "test", "networks")    # Where tracking networks are stored.
     settings.otb100_uwb_path = os.path.join(project_root, "data", "OTB100_UWB")
+    settings.custom_dataset_dir = os.path.join(project_root, "data", "CustomDataset")
+    settings.uav123_uwb_path = os.path.join(project_root, "data", "UAV123_UWB")
     settings.davis_dir = ''
     settings.got10k_lmdb_path = ''
     settings.got10k_path = ''

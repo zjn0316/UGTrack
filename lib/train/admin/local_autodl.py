@@ -15,6 +15,8 @@ class EnvironmentSettings:
         self.tensorboard_dir = os.path.join(_root, "tensorboard")
         self.pretrained_networks = os.path.join(_root, "pretrained_models")
         self.otb100_uwb_dir = os.path.join(_data, "OTB100_UWB")
+        self.custom_dataset_dir = os.path.join(_data, "CustomDataset")
+        self.uav123_uwb_dir = os.path.join(_data, "UAV123_UWB")
         self.lasot_dir = ""
         self.got10k_dir = ""
         self.got10k_val_dir = ""

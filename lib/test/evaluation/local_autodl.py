@@ -20,6 +20,8 @@ def local_env_settings():
     settings.segmentation_path = os.path.join(_output, "test", "segmentation_results")
     settings.network_path = os.path.join(_output, "test", "networks")
     settings.otb100_uwb_path = os.path.join(_data, "OTB100_UWB")
+    settings.custom_dataset_dir = os.path.join(_data, "CustomDataset")
+    settings.uav123_uwb_path = os.path.join(_data, "UAV123_UWB")
     settings.davis_dir = ""
     settings.got10k_lmdb_path = ""
     settings.got10k_path = ""
