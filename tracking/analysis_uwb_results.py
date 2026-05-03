@@ -1,3 +1,14 @@
+"""
+UV MSE            均方误差，衡量位置预测的整体偏差（归一化坐标）
+UV RMSE           均方根误差，对大误差更敏感（归一化坐标）
+UV MAE (pixel)    像素级平均绝对误差，衡量实际图像空间中的位置偏差（像素）
+In-box Rate       预测 UV 落在搜索区域内的比例，衡量预测是否在合理范围内
+Conf MAE          置信度平均绝对误差，衡量置信度预测的数值精度
+Conf RMSE         置信度均方根误差，对大偏差更敏感
+Conf Pearson      置信度皮尔逊相关系数，衡量置信度预测与真值的线性相关性
+Conf Spearman     置信度斯皮尔曼相关系数，衡量置信度排序一致性
+All / Non-occ / Occ  分别在全体/非遮挡/遮挡样本上评估
+"""
 import _init_paths
 import os
 import glob
@@ -20,12 +31,22 @@ split = 'test'
 seq_len = 10
 save_dir = 'output'                     # must match train_uwb.py --save_dir
 
-trackers = []
-# UGTrack
-# trackers.append(dict(name='ugtrack', parameter_name='s1_best_t10_bce05', display_name='UGTrack_best'))
-trackers.append(dict(name='ugtrack', parameter_name='s1_tcn_t10_bce05', display_name='UGTrack_TCN'))
-# trackers.append(dict(name='ugtrack', parameter_name='s1_gru_t10_bce05', display_name='UGTrack_GRU'))
-# trackers.append(dict(name='ugtrack', parameter_name='s1_mlp_t10_bce05', display_name='UGTrack_MLP'))
+trackers = [
+    dict(name='ugtrack', parameter_name='s1_best_t1_bce05',      seq_len=1,  display_name='Best_T1'),
+    dict(name='ugtrack', parameter_name='s1_best_t3_bce05',      seq_len=3,  display_name='Best_T3'),
+    dict(name='ugtrack', parameter_name='s1_best_t5_bce05',      seq_len=5,  display_name='Best_T5'),
+    dict(name='ugtrack', parameter_name='s1_best_t10_bce05',     seq_len=10, display_name='Best_T10'),
+    dict(name='ugtrack', parameter_name='s1_best_tbest_bce00',   seq_len=10, display_name='Best_bce00'),
+    dict(name='ugtrack', parameter_name='s1_best_tbest_bce025',  seq_len=10, display_name='Best_bce025'),
+    dict(name='ugtrack', parameter_name='s1_best_tbest_bce05',   seq_len=10, display_name='Best_bce05'),
+    dict(name='ugtrack', parameter_name='s1_best_tbest_bce10',   seq_len=10, display_name='Best_bce10'),
+    dict(name='ugtrack', parameter_name='s1_gru_t10_bce05',      seq_len=10, display_name='GRU_T10'),
+    dict(name='ugtrack', parameter_name='s1_mlp_t10_bce05',      seq_len=10, display_name='MLP_T10'),
+    dict(name='ugtrack', parameter_name='s1_tcn_t10_bce05',      seq_len=10, display_name='TCN_T10'),
+]
+
+# Global defaults (overridden by per-tracker seq_len when present)
+seq_len = 10
 
 # ============================================
 # Helpers
@@ -38,49 +59,28 @@ def _find_latest_checkpoint(ckpt_dir):
     return ckpts[-1]
 
 
-def compute_uv_error(pred_uv, gt_uv):
+def compute_uv_l2(pred_uv, gt_uv):
     return torch.norm(pred_uv - gt_uv, dim=-1).cpu().numpy()
 
 
-def compute_uv_pred_auc(errors, threshold_max=0.50, step=0.01):
-    thresholds = np.arange(step, threshold_max + step, step)
-    success_rates = np.array([(errors < t).mean() for t in thresholds])
-    norm_auc = np.trapz(success_rates, thresholds) / threshold_max
-    return thresholds, success_rates, norm_auc
+def compute_pearson(x, y):
+    n = len(x)
+    xm, ym = x.mean(), y.mean()
+    num = ((x - xm) * (y - ym)).sum()
+    den = np.sqrt(((x - xm) ** 2).sum() * ((y - ym) ** 2).sum())
+    return float(num / den) if den != 0 else 0.0
 
 
-def _roc_auc(labels, scores):
-    order = np.argsort(scores)
-    labels_sorted = labels[order]
-    pos_count = labels_sorted.sum()
-    neg_count = len(labels_sorted) - pos_count
-    if pos_count == 0 or neg_count == 0:
-        return float('nan')
-    rank_sum = (labels_sorted == 1).nonzero()[0].sum()
-    return (rank_sum - pos_count * (pos_count - 1) / 2) / (pos_count * neg_count)
-
-
-def compute_conf_auc(conf_pred, errors, error_thresh=0.05):
-    labels = (errors < error_thresh).astype(np.float32)
-    conf_scores = conf_pred.flatten()
-    if len(np.unique(labels)) < 2:
-        return float('nan')
-    return _roc_auc(labels, conf_scores)
-
-
-def compute_occlusion_auc(conf_pred, visible_flags):
-    labels = visible_flags.astype(np.float32)
-    conf_scores = conf_pred.flatten()
-    if len(np.unique(labels)) < 2:
-        return float('nan')
-    return _roc_auc(labels, conf_scores)
-
-
-def compute_losses(pred_uv, gt_uv, conf_logit, gt_conf):
-    from torch.nn.functional import l1_loss, binary_cross_entropy_with_logits
-    pred_loss = l1_loss(pred_uv, gt_uv[..., :2]).item()
-    conf_loss = binary_cross_entropy_with_logits(conf_logit, gt_conf).item()
-    return pred_loss, conf_loss, pred_loss + conf_loss
+def compute_spearman(x, y):
+    try:
+        from scipy.stats import spearmanr
+        return float(spearmanr(x, y)[0])
+    except ImportError:
+        x_rank = np.argsort(np.argsort(x)).astype(np.float64)
+        y_rank = np.argsort(np.argsort(y)).astype(np.float64)
+        n = len(x)
+        d = (x_rank - y_rank) ** 2
+        return float(1 - 6 * d.sum() / (n * (n * n - 1)))
 
 
 # ============================================
@@ -89,13 +89,15 @@ def compute_losses(pred_uv, gt_uv, conf_logit, gt_conf):
 print('Dataset: {}, split: {}, seq_len: {}'.format(dataset_name, split, seq_len))
 print()
 
-all_metrics = []
+all_results = []
 
 for t in trackers:
     name = t['name']
     param = t['parameter_name']
+    seq_len = t.get('seq_len', seq_len)
     display = t.get('display_name', param)
 
+    print('========== Evaluating {} (seq_len={}) =========='.format(display, seq_len))
     config_path = os.path.join('experiments', name, param + '.yaml')
     ckpt_dir = os.path.join(save_dir, 'checkpoints', 'train', name, param)
     ckpt_path = _find_latest_checkpoint(ckpt_dir)
@@ -122,8 +124,8 @@ for t in trackers:
     # Inference
     coord_scale = float(cfg.DATA.SEARCH.SIZE)
     all_pred_uv, all_gt_uv = [], []
-    all_conf_pred, all_conf_logit = [], []
-    all_gt_conf, all_visible = [], []
+    all_conf_pred, all_gt_conf = [], []
+    all_visible = []
 
     with torch.no_grad():
         for seq_id in range(n_seqs):
@@ -142,56 +144,91 @@ for t in trackers:
                 all_pred_uv.append(out['pred_uv'].cpu())
                 all_gt_uv.append(gt_uv.cpu())
                 all_conf_pred.append(out['uwb_conf_pred'].cpu())
-                all_conf_logit.append(out['uwb_conf_logit'].cpu())
                 all_gt_conf.append(gt_conf.cpu())
                 all_visible.append(visible[f_id])
 
     pred_uv = torch.cat(all_pred_uv, dim=0)
     gt_uv = torch.cat(all_gt_uv, dim=0)
-    conf_pred = torch.cat(all_conf_pred, dim=0)
-    conf_logit = torch.cat(all_conf_logit, dim=0)
-    gt_conf = torch.cat(all_gt_conf, dim=0)
-    visible_arr = np.array(all_visible)
+    conf_pred = torch.cat(all_conf_pred, dim=0).numpy().flatten()
+    gt_conf = torch.cat(all_gt_conf, dim=0).numpy().flatten()
 
-    # Metrics
-    pred_loss, conf_loss, total_loss = compute_losses(pred_uv, gt_uv, conf_logit, gt_conf)
-    errors = compute_uv_error(pred_uv, gt_uv)
-    _, _, uv_auc = compute_uv_pred_auc(errors)
-    conf_auc = compute_conf_auc(conf_pred, errors, error_thresh=0.05)
-    occ_auc = compute_occlusion_auc(conf_pred, visible_arr)
+    visible_arr = np.array(all_visible, dtype=np.int32)
+    if visible_arr.max() > 1:
+        visible_arr = (visible_arr == 255).astype(np.int32)
 
-    all_metrics.append((display, total_loss, pred_loss, conf_loss, uv_auc, conf_auc, occ_auc))
+    is_visible = (visible_arr == 1)
+    is_occluded = (visible_arr == 0)
+
+    l2_norm = compute_uv_l2(pred_uv, gt_uv)             # L2 in normalized [0,1]
+    l2_pixel = l2_norm * coord_scale                     # L2 in pixels
+    pred_uv_np = pred_uv.numpy()
+    in_box = ((pred_uv_np[:, 0] >= -0.01) & (pred_uv_np[:, 0] <= 1.01) &
+              (pred_uv_np[:, 1] >= -0.01) & (pred_uv_np[:, 1] <= 1.01))
+
+    # Compute metrics on All / Non-occ / Occ subsets
+    def compute_subset(selector):
+        if selector.sum() == 0:
+            return None
+        e_norm = l2_norm[selector]
+        e_pixel = l2_pixel[selector]
+        c_pred = conf_pred[selector]
+        c_gt = gt_conf[selector]
+        ib = in_box[selector]
+        return {
+            'uv_mse': float((e_norm ** 2).mean()),
+            'uv_rmse': float(np.sqrt((e_norm ** 2).mean())),
+            'uv_mae_pixel': float(e_pixel.mean()),
+            'inbox_rate': float(ib.mean()),
+            'conf_mae': float(np.abs(c_pred - c_gt).mean()),
+            'conf_rmse': float(np.sqrt(((c_pred - c_gt) ** 2).mean())),
+            'conf_pearson': compute_pearson(c_pred, c_gt),
+            'conf_spearman': compute_spearman(c_pred, c_gt),
+        }
+
+    m_all = compute_subset(np.ones(len(is_visible), dtype=bool))
+    m_occ = compute_subset(is_occluded)
+    m_nonocc = compute_subset(is_visible)
+
+    all_results.append((display, m_all, m_occ, m_nonocc))
 
     # Plot
     plot_dir = os.path.join(save_dir, 'eval_plots', param)
     os.makedirs(plot_dir, exist_ok=True)
 
-    thresholds, success_rates, _ = compute_uv_pred_auc(errors)
     fig, axes = plt.subplots(1, 3, figsize=(14, 4))
 
-    axes[0].plot(thresholds, success_rates, linewidth=2)
-    axes[0].fill_between(thresholds, success_rates, alpha=0.2)
-    axes[0].axvline(0.05, color='gray', linestyle='--', alpha=0.5, label='thresh=0.05')
-    axes[0].set_title('UV Prediction AUC = {:.4f}'.format(uv_auc))
+    axes[0].hist(l2_pixel, bins=50, alpha=0.7, edgecolor='black')
+    axes[0].axvline(l2_pixel.mean(), color='red', linestyle='--',
+                    label='mean={:.2f}px'.format(l2_pixel.mean()))
+    axes[0].set_xlabel('L2 error (pixel)')
+    axes[0].set_ylabel('Count')
+    axes[0].set_title('UV Error Distribution')
     axes[0].legend()
     axes[0].grid(True, alpha=0.3)
 
-    axes[1].hist(errors, bins=50, alpha=0.7, edgecolor='black')
-    axes[1].axvline(errors.mean(), color='red', linestyle='--',
-                    label='mean={:.4f}'.format(errors.mean()))
-    axes[1].set_title('UV Error Distribution')
-    axes[1].legend()
+    axes[1].scatter(gt_conf, conf_pred, s=2, alpha=0.3)
+    axes[1].plot([0, 1], [0, 1], 'r--', alpha=0.5)
+    axes[1].set_xlabel('Ground truth confidence')
+    axes[1].set_ylabel('Predicted confidence')
+    axes[1].set_title('Confidence Prediction')
+    axes[1].set_xlim(0, 1)
+    axes[1].set_ylim(0, 1)
     axes[1].grid(True, alpha=0.3)
+    axes[1].set_aspect('equal')
 
-    visible_errs = errors[visible_arr == 1]
-    occluded_errs = errors[visible_arr == 0]
+    visible_errs = l2_pixel[is_visible]
+    occluded_errs = l2_pixel[is_occluded]
     if len(occluded_errs) > 0:
         axes[2].hist(visible_errs, bins=40, alpha=0.6, label='visible', color='green')
         axes[2].hist(occluded_errs, bins=40, alpha=0.6, label='occluded', color='red')
+        axes[2].set_xlabel('L2 error (pixel)')
+        axes[2].set_ylabel('Count')
+        axes[2].set_title('Error by Visibility')
+        axes[2].legend()
     else:
-        axes[2].hist(errors, bins=40, alpha=0.7, edgecolor='black')
-    axes[2].set_title('Error by Visibility')
-    axes[2].legend()
+        axes[2].hist(l2_pixel, bins=40, alpha=0.7, edgecolor='black')
+        axes[2].set_xlabel('L2 error (pixel)')
+        axes[2].set_title('UV Error (no occlusion in split)')
     axes[2].grid(True, alpha=0.3)
 
     plt.tight_layout()
@@ -203,10 +240,24 @@ for t in trackers:
 # ============================================
 # Summary table
 # ============================================
-print()
-print('Results:')
-print('{:<24s}  {:>8s}  {:>8s}  {:>8s}  {:>10s}  {:>10s}  {:>12s}'.format(
-    'Tracker', 'total', 'pred', 'conf', 'uv_auc', 'conf_auc', 'occ_auc'))
-print('-' * 90)
-for m in all_metrics:
-    print('{:<24s}  {:8.5f}  {:8.5f}  {:8.5f}  {:10.4f}  {:10.4f}  {:12.4f}'.format(*m))
+def _print_table(title, data_key):
+    print()
+    print('{}:'.format(title))
+    header = '{:<22s}  {:>10s}  {:>10s}  {:>12s}  {:>9s}  {:>10s}  {:>10s}  {:>10s}  {:>10s}'.format(
+        'Tracker', 'uv_MSE', 'uv_RMSE', 'uv_MAE_px', 'In-box%', 'ConfMAE', 'ConfRMSE', 'ConfPear', 'ConfSpear')
+    print(header)
+    print('-' * len(header))
+    for display, m_all, m_occ, m_nonocc in all_results:
+        m = {'all': m_all, 'occ': m_occ, 'nocc': m_nonocc}[data_key]
+        if m is None:
+            print('{:<22s}  {:>10s}  {:>10s}  {:>12s}  {:>9s}  {:>10s}  {:>10s}  {:>10s}  {:>10s}'.format(
+                display, 'N/A', 'N/A', 'N/A', 'N/A', 'N/A', 'N/A', 'N/A', 'N/A'))
+        else:
+            print('{:<22s}  {:>10.6f}  {:>10.6f}  {:>12.6f}  {:>8.2f}%  {:>10.6f}  {:>10.6f}  {:>10.4f}  {:>10.4f}'.format(
+                display, m['uv_mse'], m['uv_rmse'], m['uv_mae_pixel'],
+                m['inbox_rate'] * 100,
+                m['conf_mae'], m['conf_rmse'], m['conf_pearson'], m['conf_spearman']))
+
+_print_table('Results - All samples', 'all')
+_print_table('Results - Non-occluded (Non-occ)', 'nocc')
+_print_table('Results - Occluded (Occ)', 'occ')
