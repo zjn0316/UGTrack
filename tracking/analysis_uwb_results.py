@@ -31,19 +31,26 @@ split = 'test'
 seq_len = 10
 save_dir = 'output'                     # must match train_uwb.py --save_dir
 
-trackers = [
-    dict(name='ugtrack', parameter_name='s1_best_t1_bce05',      seq_len=1,  display_name='Best_T1'),
-    dict(name='ugtrack', parameter_name='s1_best_t3_bce05',      seq_len=3,  display_name='Best_T3'),
-    dict(name='ugtrack', parameter_name='s1_best_t5_bce05',      seq_len=5,  display_name='Best_T5'),
-    dict(name='ugtrack', parameter_name='s1_best_t10_bce05',     seq_len=10, display_name='Best_T10'),
-    dict(name='ugtrack', parameter_name='s1_best_tbest_bce00',   seq_len=10, display_name='Best_bce00'),
-    dict(name='ugtrack', parameter_name='s1_best_tbest_bce025',  seq_len=10, display_name='Best_bce025'),
-    dict(name='ugtrack', parameter_name='s1_best_tbest_bce05',   seq_len=10, display_name='Best_bce05'),
-    dict(name='ugtrack', parameter_name='s1_best_tbest_bce10',   seq_len=10, display_name='Best_bce10'),
-    dict(name='ugtrack', parameter_name='s1_gru_t10_bce05',      seq_len=10, display_name='GRU_T10'),
-    dict(name='ugtrack', parameter_name='s1_mlp_t10_bce05',      seq_len=10, display_name='MLP_T10'),
-    dict(name='ugtrack', parameter_name='s1_tcn_t10_bce05',      seq_len=10, display_name='TCN_T10'),
-]
+# Generate all 48 tracker configs: 3 encoders x 4 seq_len x 4 bce_weight
+# Name format: s1_{encoder}_t{seq_len}_bce{weight_suffix}
+# Weight suffix: 01=0.1, 025=0.25, 05=0.5, 10=1.0
+_encoders = ['mlp', 'gru', 'tcn']
+_seq_lens = [1, 3, 5, 10]
+_weights = [('01', 0.1), ('025', 0.25), ('05', 0.5), ('10', 1.0)]
+
+trackers = []
+for enc in _encoders:
+    for sl in _seq_lens:
+        for ws, wv in _weights:
+            param = 's1_{}_t{}_bce{}'.format(enc, sl, ws)
+            display = '{}_{}_W{}'.format(
+                enc.upper(), 'T'+str(sl), ws)
+            trackers.append(dict(
+                name='ugtrack',
+                parameter_name=param,
+                seq_len=sl,
+                display_name=display,
+            ))
 
 # Global defaults (overridden by per-tracker seq_len when present)
 seq_len = 10

@@ -116,7 +116,8 @@ class BaseTrainer:
                     # 设置特定的保存节点（例如：最后一轮、每40轮、或指定的特殊轮数）
                     save_every_epoch = getattr(self.settings, "save_every_epoch", False)
                     save_epochs = [79, 159, 239]
-                    if epoch > (max_epochs - 1) or save_every_epoch or epoch % 40 == 0 or epoch in save_epochs or epoch > (max_epochs - 5):
+                    # if epoch > (max_epochs - 1) or save_every_epoch or epoch % 40 == 0 or epoch in save_epochs or epoch > (max_epochs - 5):
+                    if epoch > (max_epochs - 1) :
                         if self._checkpoint_dir:
                             # 仅在主进程中执行保存操作
                             if self.settings.local_rank in [-1, 0]:

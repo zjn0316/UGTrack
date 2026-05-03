@@ -1,0 +1,15 @@
+torch>=2.0,<2.1
+torchvision>=0.14.0,<0.16
+timm==0.5.4
+opencv-python>=4.5
+tensorboard>=2.14
+tensorboardX>=2.6
+visdom>=0.2
+tqdm
+pyyaml
+matplotlib
+numpy
+scipy
+pandas
+pillow
+thop

@@ -9,3 +9,5 @@ tensorboard/
 data/
 pretrained_models/
 .vscode/
+autodl/
+操作手册.md
