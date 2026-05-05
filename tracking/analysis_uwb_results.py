@@ -20,16 +20,21 @@ import torch
 
 from lib.train.admin import env_settings
 from lib.train.data import opencv_loader
-from lib.train.dataset import OTB100UWB
 from lib.models.ugtrack import build_ugtrack
 
 # ============================================
 # Configuration — edit before running
 # ============================================
-dataset_name = 'otb100_uwb'
 split = 'test'
-seq_len = 10
 save_dir = 'output'                     # must match train_uwb.py --save_dir
+
+# All UWB datasets to evaluate
+# Format: (display_name, class_name, root_attr)
+_datasets = [
+    ('OTB100_UWB', 'OTB100UWB', 'otb100_uwb_dir'),
+    ('UAV123_UWB', 'UAV123UWB', 'uav123_uwb_dir'),
+    ('custom_dataset', 'CustomDataset', 'custom_dataset_dir'),
+]
 
 # Generate all 48 tracker configs: 3 encoders x 4 seq_len x 4 bce_weight
 # Name format: s1_{encoder}_t{seq_len}_bce{weight_suffix}
@@ -91,170 +96,195 @@ def compute_spearman(x, y):
 
 
 # ============================================
-# Evaluate each tracker
+# Evaluate each tracker on each dataset
 # ============================================
-print('Dataset: {}, split: {}, seq_len: {}'.format(dataset_name, split, seq_len))
-print()
+# Results keyed by dataset_name -> list of (display, m_all, m_occ, m_nonocc)
+all_dataset_results = {}
 
-all_results = []
+for ds_display, ds_class_name, ds_root_attr in _datasets:
+    print()
+    print('=' * 70)
+    print('  Dataset: {}, split: {}'.format(ds_display, split))
+    print('=' * 70)
 
-for t in trackers:
-    name = t['name']
-    param = t['parameter_name']
-    seq_len = t.get('seq_len', seq_len)
-    display = t.get('display_name', param)
+    # Dynamically import dataset class
+    ds_module_name = ds_display.lower().replace('-', '_')
+    try:
+        ds_module = importlib.import_module('lib.train.dataset.{}'.format(ds_module_name))
+        DSClass = getattr(ds_module, ds_class_name)
+        ds_root = getattr(env_settings(), ds_root_attr)
+    except (ModuleNotFoundError, AttributeError) as e:
+        print('  ** SKIP: cannot load dataset {}: {}'.format(ds_display, e))
+        continue
 
-    print('========== Evaluating {} (seq_len={}) =========='.format(display, seq_len))
-    config_path = os.path.join('experiments', name, param + '.yaml')
-    ckpt_dir = os.path.join(save_dir, 'checkpoints', 'train', name, param)
-    ckpt_path = _find_latest_checkpoint(ckpt_dir)
+    if not os.path.isdir(ds_root):
+        print('  ** SKIP: dataset directory not found: {}'.format(ds_root))
+        continue
 
-    # Config & model
-    config_module = importlib.import_module('lib.config.{}.config'.format(name))
-    cfg = config_module.cfg
-    config_module.update_config_from_file(config_path)
-    cfg.TRAIN.STAGE = 1
+    all_results = []
 
-    net = build_ugtrack(cfg, training=False)
-    ckpt = torch.load(ckpt_path, map_location='cpu')
-    missing, unexpected = net.load_state_dict(ckpt['net'], strict=False)
-    if missing:
-        print('  [{}] missing_keys: {}'.format(display, missing))
-    net.cuda()
-    net.eval()
+    for t in trackers:
+        name = t['name']
+        param = t['parameter_name']
+        seq_len = t.get('seq_len', seq_len)
+        display = t.get('display_name', param)
 
-    # Dataset
-    dataset = OTB100UWB(root=env_settings().otb100_uwb_dir, image_loader=opencv_loader,
-                        split=split, uwb_seq_len=seq_len)
-    n_seqs = dataset.get_num_sequences()
+        print('========== Evaluating {} (seq_len={}) on {} =========='.format(display, seq_len, ds_display))
+        config_path = os.path.join('experiments', name, param + '.yaml')
+        ckpt_dir = os.path.join(save_dir, 'checkpoints', 'train', name, param)
+        ckpt_path = _find_latest_checkpoint(ckpt_dir)
 
-    # Inference
-    coord_scale = float(cfg.DATA.SEARCH.SIZE)
-    all_pred_uv, all_gt_uv = [], []
-    all_conf_pred, all_gt_conf = [], []
-    all_visible = []
+        # Config & model
+        config_module = importlib.import_module('lib.config.{}.config'.format(name))
+        cfg = config_module.cfg
+        config_module.update_config_from_file(config_path)
+        cfg.TRAIN.STAGE = 1
 
-    with torch.no_grad():
-        for seq_id in range(n_seqs):
-            seq_info = dataset.get_sequence_info(seq_id)
-            visible = seq_info['visible'].cpu().numpy()
+        net = build_ugtrack(cfg, training=False)
+        ckpt = torch.load(ckpt_path, map_location='cpu')
+        missing, unexpected = net.load_state_dict(ckpt['net'], strict=False)
+        if missing:
+            print('  [{}] missing_keys: {}'.format(display, missing))
+        net.cuda()
+        net.eval()
 
-            for f_id in range(seq_info['bbox'].shape[0]):
-                uwb_seq = seq_info['uwb_seq'][f_id].unsqueeze(0).cuda().float()
-                gt_uv = seq_info['uwb_gt'][f_id, :2].unsqueeze(0).cuda()
-                gt_conf = seq_info['uwb_conf'][f_id].view(1, 1).cuda().float()
+        # Dataset
+        dataset = DSClass(root=ds_root, image_loader=opencv_loader,
+                          split=split, uwb_seq_len=seq_len)
+        n_seqs = dataset.get_num_sequences()
 
-                uwb_seq = (uwb_seq / coord_scale).clamp(0.0, 1.0)
-                gt_uv = (gt_uv / coord_scale).clamp(0.0, 1.0)
+        # Inference
+        coord_scale = float(cfg.DATA.SEARCH.SIZE)
+        all_pred_uv, all_gt_uv = [], []
+        all_conf_pred, all_gt_conf = [], []
+        all_visible = []
 
-                out = net(search_uwb_seq=uwb_seq, stage=1)
-                all_pred_uv.append(out['pred_uv'].cpu())
-                all_gt_uv.append(gt_uv.cpu())
-                all_conf_pred.append(out['uwb_conf_pred'].cpu())
-                all_gt_conf.append(gt_conf.cpu())
-                all_visible.append(visible[f_id])
+        with torch.no_grad():
+            for seq_id in range(n_seqs):
+                seq_info = dataset.get_sequence_info(seq_id)
+                visible = seq_info['visible'].cpu().numpy()
 
-    pred_uv = torch.cat(all_pred_uv, dim=0)
-    gt_uv = torch.cat(all_gt_uv, dim=0)
-    conf_pred = torch.cat(all_conf_pred, dim=0).numpy().flatten()
-    gt_conf = torch.cat(all_gt_conf, dim=0).numpy().flatten()
+                for f_id in range(seq_info['bbox'].shape[0]):
+                    uwb_seq = seq_info['uwb_seq'][f_id].unsqueeze(0).cuda().float()
+                    gt_uv = seq_info['uwb_gt'][f_id, :2].unsqueeze(0).cuda()
+                    gt_conf = seq_info['uwb_conf'][f_id].view(1, 1).cuda().float()
 
-    visible_arr = np.array(all_visible, dtype=np.int32)
-    if visible_arr.max() > 1:
-        visible_arr = (visible_arr == 255).astype(np.int32)
+                    uwb_seq = (uwb_seq / coord_scale).clamp(0.0, 1.0)
+                    gt_uv = (gt_uv / coord_scale).clamp(0.0, 1.0)
 
-    is_visible = (visible_arr == 1)
-    is_occluded = (visible_arr == 0)
+                    out = net(search_uwb_seq=uwb_seq, stage=1)
+                    all_pred_uv.append(out['pred_uv'].cpu())
+                    all_gt_uv.append(gt_uv.cpu())
+                    all_conf_pred.append(out['uwb_conf_pred'].cpu())
+                    all_gt_conf.append(gt_conf.cpu())
+                    all_visible.append(visible[f_id])
 
-    l2_norm = compute_uv_l2(pred_uv, gt_uv)             # L2 in normalized [0,1]
-    l2_pixel = l2_norm * coord_scale                     # L2 in pixels
-    pred_uv_np = pred_uv.numpy()
-    in_box = ((pred_uv_np[:, 0] >= -0.01) & (pred_uv_np[:, 0] <= 1.01) &
-              (pred_uv_np[:, 1] >= -0.01) & (pred_uv_np[:, 1] <= 1.01))
+        pred_uv = torch.cat(all_pred_uv, dim=0)
+        gt_uv = torch.cat(all_gt_uv, dim=0)
+        conf_pred = torch.cat(all_conf_pred, dim=0).numpy().flatten()
+        gt_conf = torch.cat(all_gt_conf, dim=0).numpy().flatten()
 
-    # Compute metrics on All / Non-occ / Occ subsets
-    def compute_subset(selector):
-        if selector.sum() == 0:
-            return None
-        e_norm = l2_norm[selector]
-        e_pixel = l2_pixel[selector]
-        c_pred = conf_pred[selector]
-        c_gt = gt_conf[selector]
-        ib = in_box[selector]
-        return {
-            'uv_mse': float((e_norm ** 2).mean()),
-            'uv_rmse': float(np.sqrt((e_norm ** 2).mean())),
-            'uv_mae_pixel': float(e_pixel.mean()),
-            'inbox_rate': float(ib.mean()),
-            'conf_mae': float(np.abs(c_pred - c_gt).mean()),
-            'conf_rmse': float(np.sqrt(((c_pred - c_gt) ** 2).mean())),
-            'conf_pearson': compute_pearson(c_pred, c_gt),
-            'conf_spearman': compute_spearman(c_pred, c_gt),
-        }
+        visible_arr = np.array(all_visible, dtype=np.int32)
+        if visible_arr.max() > 1:
+            visible_arr = (visible_arr == 255).astype(np.int32)
 
-    m_all = compute_subset(np.ones(len(is_visible), dtype=bool))
-    m_occ = compute_subset(is_occluded)
-    m_nonocc = compute_subset(is_visible)
+        is_visible = (visible_arr == 1)
+        is_occluded = (visible_arr == 0)
 
-    all_results.append((display, m_all, m_occ, m_nonocc))
+        l2_norm = compute_uv_l2(pred_uv, gt_uv)             # L2 in normalized [0,1]
+        l2_pixel = l2_norm * coord_scale                     # L2 in pixels
+        pred_uv_np = pred_uv.numpy()
+        in_box = ((pred_uv_np[:, 0] >= -0.01) & (pred_uv_np[:, 0] <= 1.01) &
+                  (pred_uv_np[:, 1] >= -0.01) & (pred_uv_np[:, 1] <= 1.01))
 
-    # Plot
-    plot_dir = os.path.join(save_dir, 'eval_plots', param)
-    os.makedirs(plot_dir, exist_ok=True)
+        # Compute metrics on All / Non-occ / Occ subsets
+        def compute_subset(selector):
+            if selector.sum() == 0:
+                return None
+            e_norm = l2_norm[selector]
+            e_pixel = l2_pixel[selector]
+            c_pred = conf_pred[selector]
+            c_gt = gt_conf[selector]
+            ib = in_box[selector]
+            return {
+                'uv_mse': float((e_norm ** 2).mean()),
+                'uv_rmse': float(np.sqrt((e_norm ** 2).mean())),
+                'uv_mae_pixel': float(e_pixel.mean()),
+                'inbox_rate': float(ib.mean()),
+                'conf_mae': float(np.abs(c_pred - c_gt).mean()),
+                'conf_rmse': float(np.sqrt(((c_pred - c_gt) ** 2).mean())),
+                'conf_pearson': compute_pearson(c_pred, c_gt),
+                'conf_spearman': compute_spearman(c_pred, c_gt),
+            }
 
-    fig, axes = plt.subplots(1, 3, figsize=(14, 4))
+        m_all = compute_subset(np.ones(len(is_visible), dtype=bool))
+        m_occ = compute_subset(is_occluded)
+        m_nonocc = compute_subset(is_visible)
 
-    axes[0].hist(l2_pixel, bins=50, alpha=0.7, edgecolor='black')
-    axes[0].axvline(l2_pixel.mean(), color='red', linestyle='--',
-                    label='mean={:.2f}px'.format(l2_pixel.mean()))
-    axes[0].set_xlabel('L2 error (pixel)')
-    axes[0].set_ylabel('Count')
-    axes[0].set_title('UV Error Distribution')
-    axes[0].legend()
-    axes[0].grid(True, alpha=0.3)
+        all_results.append((display, m_all, m_occ, m_nonocc))
 
-    axes[1].scatter(gt_conf, conf_pred, s=2, alpha=0.3)
-    axes[1].plot([0, 1], [0, 1], 'r--', alpha=0.5)
-    axes[1].set_xlabel('Ground truth confidence')
-    axes[1].set_ylabel('Predicted confidence')
-    axes[1].set_title('Confidence Prediction')
-    axes[1].set_xlim(0, 1)
-    axes[1].set_ylim(0, 1)
-    axes[1].grid(True, alpha=0.3)
-    axes[1].set_aspect('equal')
+        # # Plot (disabled: delete eval_plots/ to remove saved figures)
+        # plot_dir = os.path.join(save_dir, 'eval_plots', param)
+        # os.makedirs(plot_dir, exist_ok=True)
+        #
+        # fig, axes = plt.subplots(1, 3, figsize=(14, 4))
+        #
+        # axes[0].hist(l2_pixel, bins=50, alpha=0.7, edgecolor='black')
+        # axes[0].axvline(l2_pixel.mean(), color='red', linestyle='--',
+        #                 label='mean={:.2f}px'.format(l2_pixel.mean()))
+        # axes[0].set_xlabel('L2 error (pixel)')
+        # axes[0].set_ylabel('Count')
+        # axes[0].set_title('UV Error Distribution ({})'.format(ds_display))
+        # axes[0].legend()
+        # axes[0].grid(True, alpha=0.3)
+        #
+        # axes[1].scatter(gt_conf, conf_pred, s=2, alpha=0.3)
+        # axes[1].plot([0, 1], [0, 1], 'r--', alpha=0.5)
+        # axes[1].set_xlabel('Ground truth confidence')
+        # axes[1].set_ylabel('Predicted confidence')
+        # axes[1].set_title('Confidence Prediction ({})'.format(ds_display))
+        # axes[1].set_xlim(0, 1)
+        # axes[1].set_ylim(0, 1)
+        # axes[1].grid(True, alpha=0.3)
+        # axes[1].set_aspect('equal')
+        #
+        # visible_errs = l2_pixel[is_visible]
+        # occluded_errs = l2_pixel[is_occluded]
+        # if len(occluded_errs) > 0:
+        #     axes[2].hist(visible_errs, bins=40, alpha=0.6, label='visible', color='green')
+        #     axes[2].hist(occluded_errs, bins=40, alpha=0.6, label='occluded', color='red')
+        #     axes[2].set_xlabel('L2 error (pixel)')
+        #     axes[2].set_ylabel('Count')
+        #     axes[2].set_title('Error by Visibility ({})'.format(ds_display))
+        #     axes[2].legend()
+        # else:
+        #     axes[2].hist(l2_pixel, bins=40, alpha=0.7, edgecolor='black')
+        #     axes[2].set_xlabel('L2 error (pixel)')
+        #     axes[2].set_title('UV Error (no occlusion in {})'.format(ds_display))
+        # axes[2].grid(True, alpha=0.3)
+        #
+        # plt.tight_layout()
+        # plot_path = os.path.join(plot_dir, '{}_{}_uwb_eval.png'.format(ds_display.lower(), param))
+        # plt.savefig(plot_path, dpi=150)
+        # plt.close(fig)
+        # print('Plot saved: {}'.format(plot_path))
 
-    visible_errs = l2_pixel[is_visible]
-    occluded_errs = l2_pixel[is_occluded]
-    if len(occluded_errs) > 0:
-        axes[2].hist(visible_errs, bins=40, alpha=0.6, label='visible', color='green')
-        axes[2].hist(occluded_errs, bins=40, alpha=0.6, label='occluded', color='red')
-        axes[2].set_xlabel('L2 error (pixel)')
-        axes[2].set_ylabel('Count')
-        axes[2].set_title('Error by Visibility')
-        axes[2].legend()
-    else:
-        axes[2].hist(l2_pixel, bins=40, alpha=0.7, edgecolor='black')
-        axes[2].set_xlabel('L2 error (pixel)')
-        axes[2].set_title('UV Error (no occlusion in split)')
-    axes[2].grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    plot_path = os.path.join(plot_dir, '{}_uwb_eval.png'.format(param))
-    plt.savefig(plot_path, dpi=150)
-    plt.close(fig)
-    print('Plot saved: {}'.format(plot_path))
+    all_dataset_results[ds_display] = all_results
 
 # ============================================
-# Summary table
+# Summary tables per dataset
 # ============================================
-def _print_table(title, data_key):
+def _fmt(val):
+    return '{:.6f}'.format(val)
+
+def _print_table(title, data_key, results):
     print()
     print('{}:'.format(title))
     header = '{:<22s}  {:>10s}  {:>10s}  {:>12s}  {:>9s}  {:>10s}  {:>10s}  {:>10s}  {:>10s}'.format(
         'Tracker', 'uv_MSE', 'uv_RMSE', 'uv_MAE_px', 'In-box%', 'ConfMAE', 'ConfRMSE', 'ConfPear', 'ConfSpear')
     print(header)
     print('-' * len(header))
-    for display, m_all, m_occ, m_nonocc in all_results:
+    for display, m_all, m_occ, m_nonocc in results:
         m = {'all': m_all, 'occ': m_occ, 'nocc': m_nonocc}[data_key]
         if m is None:
             print('{:<22s}  {:>10s}  {:>10s}  {:>12s}  {:>9s}  {:>10s}  {:>10s}  {:>10s}  {:>10s}'.format(
@@ -265,6 +295,11 @@ def _print_table(title, data_key):
                 m['inbox_rate'] * 100,
                 m['conf_mae'], m['conf_rmse'], m['conf_pearson'], m['conf_spearman']))
 
-_print_table('Results - All samples', 'all')
-_print_table('Results - Non-occluded (Non-occ)', 'nocc')
-_print_table('Results - Occluded (Occ)', 'occ')
+for ds_display in all_dataset_results:
+    print()
+    print('#' * 70)
+    print('#  Dataset: {}'.format(ds_display))
+    print('#' * 70)
+    _print_table('Results - All samples ({})'.format(ds_display), 'all', all_dataset_results[ds_display])
+    _print_table('Results - Non-occluded ({})'.format(ds_display), 'nocc', all_dataset_results[ds_display])
+    _print_table('Results - Occluded ({})'.format(ds_display), 'occ', all_dataset_results[ds_display])

@@ -5,6 +5,10 @@ opencv-python>=4.5
 tensorboard>=2.14
 tensorboardX>=2.6
 visdom>=0.2
+jpeg4py
+pycocotools
+lmdb
+easydict
 tqdm
 pyyaml
 matplotlib
