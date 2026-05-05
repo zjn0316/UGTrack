@@ -38,7 +38,6 @@ def names2datasets(name_list: list, settings, image_loader, split='train'):
     datasets = []
     for name in name_list:
         # 限定当前支持的数据集名称范围，便于后续增量扩展。
-        assert name in ['OTB100_UWB']
         if name == 'OTB100_UWB':
             datasets.append(
                 OTB100UWB(
@@ -48,6 +47,26 @@ def names2datasets(name_list: list, settings, image_loader, split='train'):
                     uwb_seq_len=settings.uwb_seq_len,
                 )
             )
+        elif name == 'UAV123_UWB':
+            datasets.append(
+                UAV123UWB(
+                    settings.env.uav123_uwb_dir,
+                    split=split,
+                    image_loader=image_loader,
+                    uwb_seq_len=settings.uwb_seq_len,
+                )
+            )
+        elif name == 'CUSTOM_DATASET':
+            datasets.append(
+                CustomDataset(
+                    settings.env.custom_dataset_dir,
+                    split=split,
+                    image_loader=image_loader,
+                    uwb_seq_len=settings.uwb_seq_len,
+                )
+            )
+        else:
+            raise ValueError(f'Unknown dataset: {name}')
     return datasets
 
 
