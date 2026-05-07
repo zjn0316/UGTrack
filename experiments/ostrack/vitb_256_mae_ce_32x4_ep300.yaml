@@ -14,20 +14,14 @@ DATA:
     - OTB100_UWB
     - UAV123_UWB
     - CUSTOM_DATASET
-    DATASETS_RATIO:
-    - 1
-    - 1
-    - 1
+    DATASETS_RATIO: [5, 8, 2]
     SAMPLE_PER_EPOCH: 60000
   VAL:
     DATASETS_NAME:
     - OTB100_UWB
     - UAV123_UWB
     - CUSTOM_DATASET
-    DATASETS_RATIO:
-    - 1
-    - 1
-    - 1
+    DATASETS_RATIO: [5, 8, 2]
     SAMPLE_PER_EPOCH: 10000
   SEARCH:
     NUMBER: 1

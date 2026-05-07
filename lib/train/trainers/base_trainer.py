@@ -291,7 +291,7 @@ class BaseTrainer:
 
         missing_k, unexpected_k = net.load_state_dict(checkpoint_dict["net"], strict=False)
         print("previous checkpoint is loaded.")
-        print("missing keys: ", missing_k)
-        print("unexpected keys:", unexpected_k)
+        # print("missing keys: ", missing_k)
+        # print("unexpected keys:", unexpected_k)
 
         return True

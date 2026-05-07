@@ -9,5 +9,5 @@ __pycache__/
 /data/
 /pretrained_models/
 .vscode/
-autodl/
+/autodl/
 操作手册.md

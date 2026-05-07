@@ -1,305 +1,468 @@
-"""
-UV MSE            均方误差，衡量位置预测的整体偏差（归一化坐标）
-UV RMSE           均方根误差，对大误差更敏感（归一化坐标）
-UV MAE (pixel)    像素级平均绝对误差，衡量实际图像空间中的位置偏差（像素）
-In-box Rate       预测 UV 落在搜索区域内的比例，衡量预测是否在合理范围内
-Conf MAE          置信度平均绝对误差，衡量置信度预测的数值精度
-Conf RMSE         置信度均方根误差，对大偏差更敏感
-Conf Pearson      置信度皮尔逊相关系数，衡量置信度预测与真值的线性相关性
-Conf Spearman     置信度斯皮尔曼相关系数，衡量置信度排序一致性
-All / Non-occ / Occ  分别在全体/非遮挡/遮挡样本上评估
-"""
 import _init_paths
 import os
-import glob
+import csv
 import importlib
 
-import matplotlib.pyplot as plt
 import numpy as np
-import torch
+import matplotlib.pyplot as plt
+plt.rcParams['figure.figsize'] = [8, 8]
+
+from PIL import Image
 
 from lib.train.admin import env_settings
 from lib.train.data import opencv_loader
-from lib.models.ugtrack import build_ugtrack
 
-# ============================================
-# Configuration — edit before running
-# ============================================
+
+# =========================================================
+# config
+# =========================================================
+save_dir = 'output'
 split = 'test'
-save_dir = 'output'                     # must match train_uwb.py --save_dir
 
-# All UWB datasets to evaluate
-# Format: (display_name, class_name, root_attr)
-_datasets = [
-    ('OTB100_UWB', 'OTB100UWB', 'otb100_uwb_dir'),
-    ('UAV123_UWB', 'UAV123UWB', 'uav123_uwb_dir'),
-    ('custom_dataset', 'CustomDataset', 'custom_dataset_dir'),
+# 要分析哪些数据集，就放哪些
+dataset_names = [
+    'otb100_uwb',
+    'uav123_uwb',
+    'custom_dataset',
 ]
 
-# Generate all 48 tracker configs: 3 encoders x 4 seq_len x 4 bce_weight
-# Name format: s1_{encoder}_t{seq_len}_bce{weight_suffix}
-# Weight suffix: 01=0.1, 025=0.25, 05=0.5, 10=1.0
-_encoders = ['mlp', 'gru', 'tcn']
-_seq_lens = [1, 3, 5, 10]
-_weights = [('01', 0.1), ('025', 0.25), ('05', 0.5), ('10', 1.0)]
 
-trackers = []
-for enc in _encoders:
-    for sl in _seq_lens:
-        for ws, wv in _weights:
-            param = 's1_{}_t{}_bce{}'.format(enc, sl, ws)
-            display = '{}_{}_W{}'.format(
-                enc.upper(), 'T'+str(sl), ws)
-            trackers.append(dict(
-                name='ugtrack',
-                parameter_name=param,
-                seq_len=sl,
-                display_name=display,
-            ))
-
-# Global defaults (overridden by per-tracker seq_len when present)
-seq_len = 10
-
-# ============================================
-# Helpers
-# ============================================
-
-def _find_latest_checkpoint(ckpt_dir):
-    ckpts = sorted(glob.glob(os.path.join(ckpt_dir, '*_ep*.pth.tar')))
-    if not ckpts:
-        raise FileNotFoundError('No checkpoint found in {}'.format(ckpt_dir))
-    return ckpts[-1]
+# =========================================================
+# trackerlist-style config
+# =========================================================
+def uwb_trackerlist(name, parameter_name, dataset_name, seq_len, run_ids=None, display_name=None):
+    if run_ids is None or isinstance(run_ids, int):
+        run_ids = [run_ids]
+    return [{
+        'name': name,
+        'parameter_name': parameter_name,
+        'dataset_name': dataset_name,
+        'seq_len': seq_len,
+        'run_id': run_id,
+        'display_name': display_name if display_name is not None else parameter_name
+    } for run_id in run_ids]
 
 
-def compute_uv_l2(pred_uv, gt_uv):
-    return torch.norm(pred_uv - gt_uv, dim=-1).cpu().numpy()
+def build_trackers(dataset_name):
+    trackers = []
+
+    """stage1 encoder"""
+    trackers.extend(uwb_trackerlist(name='ugtrack',
+                                    parameter_name='stage1_encoder_mlp_seq5_confw10',
+                                    dataset_name=dataset_name,
+                                    seq_len=5,
+                                    run_ids=None,
+                                    display_name='MLP'))
+    trackers.extend(uwb_trackerlist(name='ugtrack',
+                                    parameter_name='stage1_encoder_gru_seq5_confw10',
+                                    dataset_name=dataset_name,
+                                    seq_len=5,
+                                    run_ids=None,
+                                    display_name='GRU'))
+    trackers.extend(uwb_trackerlist(name='ugtrack',
+                                    parameter_name='stage1_encoder_tcn_seq5_confw10',
+                                    dataset_name=dataset_name,
+                                    seq_len=5,
+                                    run_ids=None,
+                                    display_name='TCN'))
+    return trackers
 
 
-def compute_pearson(x, y):
-    n = len(x)
+# =========================================================
+# dataset registry
+# =========================================================
+_DATASET_INFO = {
+    'otb100_uwb': {
+        'display_name': 'OTB100_UWB',
+        'module_name': 'otb100_uwb',
+        'class_name': 'OTB100UWB',
+        'root_attr': 'otb100_uwb_dir',
+    },
+    'uav123_uwb': {
+        'display_name': 'UAV123_UWB',
+        'module_name': 'uav123_uwb',
+        'class_name': 'UAV123UWB',
+        'root_attr': 'uav123_uwb_dir',
+    },
+    'custom_dataset': {
+        'display_name': 'CUSTOM_DATASET',
+        'module_name': 'custom_dataset',
+        'class_name': 'CustomDataset',
+        'root_attr': 'custom_dataset_dir',
+    },
+}
+
+
+# =========================================================
+# helpers
+# =========================================================
+def get_uwb_dataset(dataset_name, split='test', seq_len=5):
+    dataset_key = dataset_name.lower()
+    if dataset_key not in _DATASET_INFO:
+        raise ValueError('Unknown dataset: {}. Available: {}'.format(
+            dataset_name, list(_DATASET_INFO.keys()))
+        )
+
+    info = _DATASET_INFO[dataset_key]
+    ds_module = importlib.import_module('lib.train.dataset.{}'.format(info['module_name']))
+    ds_class = getattr(ds_module, info['class_name'])
+    ds_root = getattr(env_settings(), info['root_attr'])
+
+    dataset = ds_class(
+        root=ds_root,
+        image_loader=opencv_loader,
+        split=split,
+        uwb_seq_len=seq_len
+    )
+    return dataset, info['display_name']
+
+
+def _results_dir(base_save_dir, dataset_name, tracker_name, parameter_name):
+    # 注意：这里必须用小写 dataset_name，而不是 display_name
+    return os.path.join(base_save_dir, 'test', 'uwb_results', dataset_name, tracker_name, parameter_name)
+
+
+def _safe_load_txt(path):
+    if not os.path.isfile(path):
+        raise FileNotFoundError('Missing result file: {}'.format(path))
+    arr = np.loadtxt(path, delimiter='\t')
+    if arr.ndim == 0:
+        arr = np.array([arr])
+    return arr
+
+
+def _compute_uv_l2(pred_uv_norm, gt_uv_norm):
+    return np.linalg.norm(pred_uv_norm - gt_uv_norm, axis=1)
+
+
+def _compute_pearson(x, y):
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    if len(x) == 0:
+        return 0.0
     xm, ym = x.mean(), y.mean()
     num = ((x - xm) * (y - ym)).sum()
     den = np.sqrt(((x - xm) ** 2).sum() * ((y - ym) ** 2).sum())
     return float(num / den) if den != 0 else 0.0
 
 
-def compute_spearman(x, y):
+def _compute_spearman(x, y):
     try:
         from scipy.stats import spearmanr
-        return float(spearmanr(x, y)[0])
+        val = spearmanr(x, y)[0]
+        return float(val) if val == val else 0.0
     except ImportError:
-        x_rank = np.argsort(np.argsort(x)).astype(np.float64)
-        y_rank = np.argsort(np.argsort(y)).astype(np.float64)
+        x = np.asarray(x)
+        y = np.asarray(y)
         n = len(x)
-        d = (x_rank - y_rank) ** 2
+        if n <= 1:
+            return 0.0
+        xr = np.argsort(np.argsort(x)).astype(np.float64)
+        yr = np.argsort(np.argsort(y)).astype(np.float64)
+        d = (xr - yr) ** 2
         return float(1 - 6 * d.sum() / (n * (n * n - 1)))
 
 
-# ============================================
-# Evaluate each tracker on each dataset
-# ============================================
-# Results keyed by dataset_name -> list of (display, m_all, m_occ, m_nonocc)
-all_dataset_results = {}
+def _compute_auc_from_errors(err, max_thr=0.05, num=101):
+    if len(err) == 0:
+        return 0.0
+    thrs = np.linspace(0.0, max_thr, num=num)
+    curve = [(err <= t).mean() for t in thrs]
+    auc = np.trapz(curve, thrs) / max_thr
+    return float(auc)
 
-for ds_display, ds_class_name, ds_root_attr in _datasets:
+
+def _get_image_size(seq_path):
+    """Return (width, height) of the first frame image in the sequence."""
+    first_img = sorted([f for f in os.listdir(seq_path)
+                        if f.endswith(('.jpg', '.jpeg', '.png'))])[0]
+    img = Image.open(os.path.join(seq_path, first_img))
+    return img.size  # (width, height)
+
+
+def _compute_subset_metrics(selector, l2_norm, l2_pixel, conf_pred, gt_conf, pred_uv_img, img_w, img_h):
+    if selector.sum() == 0:
+        return None
+
+    e_norm = l2_norm[selector]
+    e_pixel = l2_pixel[selector]
+    c_pred = conf_pred[selector]
+    c_gt = gt_conf[selector]
+    pred_sub = pred_uv_img[selector]
+
+    # Check whether prediction falls within the valid image coordinate range
+    in_range = (
+        (pred_sub[:, 0] >= 0.0) & (pred_sub[:, 0] <= img_w) &
+        (pred_sub[:, 1] >= 0.0) & (pred_sub[:, 1] <= img_h)
+    )
+
+    return {
+        'uv_pred_auc': _compute_auc_from_errors(e_norm, max_thr=0.05, num=101),
+        'uv_l2_mean': float(e_norm.mean()),
+        'uv_mse': float((e_norm ** 2).mean()),
+        'uv_rmse': float(np.sqrt((e_norm ** 2).mean())),
+        'uv_mae_pixel': float(e_pixel.mean()),
+        'inrange_rate': float(in_range.mean()),
+        'conf_mae': float(np.abs(c_pred - c_gt).mean()),
+        'conf_rmse': float(np.sqrt(((c_pred - c_gt) ** 2).mean())),
+        'conf_pearson': _compute_pearson(c_pred, c_gt),
+        'conf_spearman': _compute_spearman(c_pred, c_gt),
+    }
+
+
+def _print_table(title, subset_key, results):
     print()
-    print('=' * 70)
-    print('  Dataset: {}, split: {}'.format(ds_display, split))
-    print('=' * 70)
+    print(title)
+    header = (
+        f"{'Tracker':<8s}  "
+        f"{'AUC':>8s}  "
+        f"{'L2mean':>10s}  "
+        f"{'uv_MAE_px':>12s}  "
+        f"{'In-range%':>10s}  "
+        f"{'ConfMAE':>10s}  "
+        f"{'ConfRMSE':>10s}  "
+        f"{'ConfPear':>10s}  "
+        f"{'ConfSpear':>10s}"
+    )
+    print(header)
+    print('-' * len(header))
 
-    # Dynamically import dataset class
-    ds_module_name = ds_display.lower().replace('-', '_')
-    try:
-        ds_module = importlib.import_module('lib.train.dataset.{}'.format(ds_module_name))
-        DSClass = getattr(ds_module, ds_class_name)
-        ds_root = getattr(env_settings(), ds_root_attr)
-    except (ModuleNotFoundError, AttributeError) as e:
-        print('  ** SKIP: cannot load dataset {}: {}'.format(ds_display, e))
-        continue
+    for row in results:
+        m = row[subset_key]
+        if m is None:
+            print(f"{row['tracker']:<8s}  {'N/A':>8s}  {'N/A':>10s}  {'N/A':>12s}  {'N/A':>9s}  {'N/A':>10s}  {'N/A':>10s}  {'N/A':>10s}  {'N/A':>10s}")
+        else:
+            print(
+                f"{row['tracker']:<8s}  "
+                f"{m['uv_pred_auc']:>8.4f}  "
+                f"{m['uv_l2_mean']:>10.6f}  "
+                f"{m['uv_mae_pixel']:>12.6f}  "
+                f"{m['inrange_rate'] * 100:>9.2f}%  "
+                f"{m['conf_mae']:>10.6f}  "
+                f"{m['conf_rmse']:>10.6f}  "
+                f"{m['conf_pearson']:>10.4f}  "
+                f"{m['conf_spearman']:>10.4f}"
+            )
 
-    if not os.path.isdir(ds_root):
-        print('  ** SKIP: dataset directory not found: {}'.format(ds_root))
-        continue
 
-    all_results = []
+def print_uwb_results(trackers, dataset, dataset_name, dataset_display_name, split='test', save_dir='output'):
+    """Evaluate UWB prediction results.
+
+    test_uwb.py now saves predictions in image-pixel space (using center-relative
+    normalization matching training, then denormalizing back to pixels).
+    GT is also in image pixel space — they can be compared directly.
+    """
+    dataset_results = []
+    csv_rows = []
 
     for t in trackers:
-        name = t['name']
-        param = t['parameter_name']
-        seq_len = t.get('seq_len', seq_len)
-        display = t.get('display_name', param)
+        tracker_name = t['name']
+        parameter_name = t['parameter_name']
+        display_name = t['display_name']
 
-        print('========== Evaluating {} (seq_len={}) on {} =========='.format(display, seq_len, ds_display))
-        config_path = os.path.join('experiments', name, param + '.yaml')
-        ckpt_dir = os.path.join(save_dir, 'checkpoints', 'train', name, param)
-        ckpt_path = _find_latest_checkpoint(ckpt_dir)
+        result_dir = _results_dir(save_dir, dataset_name, tracker_name, parameter_name)
+        print('>>> Evaluating {} from {}'.format(display_name, result_dir))
 
-        # Config & model
-        config_module = importlib.import_module('lib.config.{}.config'.format(name))
-        cfg = config_module.cfg
-        config_module.update_config_from_file(config_path)
-        cfg.TRAIN.STAGE = 1
-
-        net = build_ugtrack(cfg, training=False)
-        ckpt = torch.load(ckpt_path, map_location='cpu')
-        missing, unexpected = net.load_state_dict(ckpt['net'], strict=False)
-        if missing:
-            print('  [{}] missing_keys: {}'.format(display, missing))
-        net.cuda()
-        net.eval()
-
-        # Dataset
-        dataset = DSClass(root=ds_root, image_loader=opencv_loader,
-                          split=split, uwb_seq_len=seq_len)
-        n_seqs = dataset.get_num_sequences()
-
-        # Inference
-        coord_scale = float(cfg.DATA.SEARCH.SIZE)
-        all_pred_uv, all_gt_uv = [], []
-        all_conf_pred, all_gt_conf = [], []
+        all_pred_uv_img = []
+        all_gt_uv_img = []
+        all_conf_pred = []
+        all_gt_conf = []
         all_visible = []
+        all_img_w = []
+        all_img_h = []
 
-        with torch.no_grad():
-            for seq_id in range(n_seqs):
-                seq_info = dataset.get_sequence_info(seq_id)
-                visible = seq_info['visible'].cpu().numpy()
+        for seq_id in range(dataset.get_num_sequences()):
+            seq_name = dataset.sequence_list[seq_id]
+            seq_info = dataset.get_sequence_info(seq_id)
+            seq_path = dataset._get_sequence_path(seq_id)
 
-                for f_id in range(seq_info['bbox'].shape[0]):
-                    uwb_seq = seq_info['uwb_seq'][f_id].unsqueeze(0).cuda().float()
-                    gt_uv = seq_info['uwb_gt'][f_id, :2].unsqueeze(0).cuda()
-                    gt_conf = seq_info['uwb_conf'][f_id].view(1, 1).cuda().float()
+            pred_uv_path = os.path.join(result_dir, '{}_pred_uv.txt'.format(seq_name))
+            conf_path = os.path.join(result_dir, '{}_conf.txt'.format(seq_name))
 
-                    uwb_seq = (uwb_seq / coord_scale).clamp(0.0, 1.0)
-                    gt_uv = (gt_uv / coord_scale).clamp(0.0, 1.0)
+            pred_uv_pixel = _safe_load_txt(pred_uv_path)
+            conf_pred = _safe_load_txt(conf_path).reshape(-1)
 
-                    out = net(search_uwb_seq=uwb_seq, stage=1)
-                    all_pred_uv.append(out['pred_uv'].cpu())
-                    all_gt_uv.append(gt_uv.cpu())
-                    all_conf_pred.append(out['uwb_conf_pred'].cpu())
-                    all_gt_conf.append(gt_conf.cpu())
-                    all_visible.append(visible[f_id])
+            gt_uv_pixel = seq_info['uwb_gt'][:, :2].cpu().numpy()
+            gt_conf = seq_info['uwb_conf'].cpu().numpy().reshape(-1)
+            visible = seq_info['visible'].cpu().numpy().reshape(-1)
 
-        pred_uv = torch.cat(all_pred_uv, dim=0)
-        gt_uv = torch.cat(all_gt_uv, dim=0)
-        conf_pred = torch.cat(all_conf_pred, dim=0).numpy().flatten()
-        gt_conf = torch.cat(all_gt_conf, dim=0).numpy().flatten()
+            if pred_uv_pixel.ndim == 1:
+                pred_uv_pixel = pred_uv_pixel.reshape(-1, 2)
 
-        visible_arr = np.array(all_visible, dtype=np.int32)
+            if pred_uv_pixel.shape[0] != gt_uv_pixel.shape[0]:
+                raise ValueError(
+                    'Frame count mismatch in {}: pred {} vs gt {}'.format(
+                        seq_name, pred_uv_pixel.shape[0], gt_uv_pixel.shape[0]
+                    )
+                )
+
+            img_w, img_h = _get_image_size(seq_path)
+            n_frames = pred_uv_pixel.shape[0]
+
+            all_pred_uv_img.append(pred_uv_pixel)
+            all_gt_uv_img.append(gt_uv_pixel)
+            all_conf_pred.append(conf_pred)
+            all_gt_conf.append(gt_conf)
+            all_visible.append(visible)
+            all_img_w.append(np.full(n_frames, img_w, dtype=np.float32))
+            all_img_h.append(np.full(n_frames, img_h, dtype=np.float32))
+
+        pred_uv_img = np.concatenate(all_pred_uv_img, axis=0)
+        gt_uv_img = np.concatenate(all_gt_uv_img, axis=0)
+        img_w_arr = np.concatenate(all_img_w, axis=0)
+        img_h_arr = np.concatenate(all_img_h, axis=0)
+        conf_pred = np.concatenate(all_conf_pred, axis=0)
+        gt_conf = np.concatenate(all_gt_conf, axis=0)
+        visible_arr = np.concatenate(all_visible, axis=0).astype(np.int32)
+
         if visible_arr.max() > 1:
             visible_arr = (visible_arr == 255).astype(np.int32)
 
         is_visible = (visible_arr == 1)
         is_occluded = (visible_arr == 0)
 
-        l2_norm = compute_uv_l2(pred_uv, gt_uv)             # L2 in normalized [0,1]
-        l2_pixel = l2_norm * coord_scale                     # L2 in pixels
-        pred_uv_np = pred_uv.numpy()
-        in_box = ((pred_uv_np[:, 0] >= -0.01) & (pred_uv_np[:, 0] <= 1.01) &
-                  (pred_uv_np[:, 1] >= -0.01) & (pred_uv_np[:, 1] <= 1.01))
+        # Normalized L2 (per-axis by image dimensions, for AUC)
+        l2_norm = np.sqrt(
+            ((pred_uv_img[:, 0] - gt_uv_img[:, 0]) / img_w_arr) ** 2 +
+            ((pred_uv_img[:, 1] - gt_uv_img[:, 1]) / img_h_arr) ** 2
+        )
+        # Pixel L2 (for uv_MAE_px)
+        l2_pixel = np.sqrt(
+            (pred_uv_img[:, 0] - gt_uv_img[:, 0]) ** 2 +
+            (pred_uv_img[:, 1] - gt_uv_img[:, 1]) ** 2
+        )
 
-        # Compute metrics on All / Non-occ / Occ subsets
-        def compute_subset(selector):
-            if selector.sum() == 0:
-                return None
-            e_norm = l2_norm[selector]
-            e_pixel = l2_pixel[selector]
-            c_pred = conf_pred[selector]
-            c_gt = gt_conf[selector]
-            ib = in_box[selector]
-            return {
-                'uv_mse': float((e_norm ** 2).mean()),
-                'uv_rmse': float(np.sqrt((e_norm ** 2).mean())),
-                'uv_mae_pixel': float(e_pixel.mean()),
-                'inbox_rate': float(ib.mean()),
-                'conf_mae': float(np.abs(c_pred - c_gt).mean()),
-                'conf_rmse': float(np.sqrt(((c_pred - c_gt) ** 2).mean())),
-                'conf_pearson': compute_pearson(c_pred, c_gt),
-                'conf_spearman': compute_spearman(c_pred, c_gt),
+        m_all = _compute_subset_metrics(
+            np.ones(len(l2_norm), dtype=bool),
+            l2_norm, l2_pixel, conf_pred, gt_conf,
+            pred_uv_img, img_w_arr[0], img_h_arr[0]
+        )
+        m_nocc = _compute_subset_metrics(
+            is_visible,
+            l2_norm, l2_pixel, conf_pred, gt_conf,
+            pred_uv_img, img_w_arr[0], img_h_arr[0]
+        )
+        m_occ = _compute_subset_metrics(
+            is_occluded,
+            l2_norm, l2_pixel, conf_pred, gt_conf,
+            pred_uv_img, img_w_arr[0], img_h_arr[0]
+        )
+
+        dataset_results.append({
+            'tracker': display_name,
+            'all': m_all,
+            'nocc': m_nocc,
+            'occ': m_occ,
+        })
+
+        for subset_name, subset_metrics in [('all', m_all), ('nocc', m_nocc), ('occ', m_occ)]:
+            row = {
+                'dataset': dataset_display_name,
+                'tracker': display_name,
+                'subset': subset_name
             }
+            if subset_metrics is None:
+                row.update({
+                    'uv_pred_auc': None,
+                    'uv_l2_mean': None,
+                    'uv_mse': None,
+                    'uv_rmse': None,
+                    'uv_mae_pixel': None,
+                    'inrange_rate': None,
+                    'conf_mae': None,
+                    'conf_rmse': None,
+                    'conf_pearson': None,
+                    'conf_spearman': None,
+                })
+            else:
+                row.update(subset_metrics)
+            csv_rows.append(row)
 
-        m_all = compute_subset(np.ones(len(is_visible), dtype=bool))
-        m_occ = compute_subset(is_occluded)
-        m_nonocc = compute_subset(is_visible)
+    dataset_results.sort(
+        key=lambda x: (
+            -(x['all']['uv_pred_auc'] if x['all'] is not None else -1e9),
+            x['all']['uv_mae_pixel'] if x['all'] is not None else 1e9,
+            x['all']['conf_mae'] if x['all'] is not None else 1e9,
+        )
+    )
 
-        all_results.append((display, m_all, m_occ, m_nonocc))
+    _print_table('Results - All ({})'.format(dataset_display_name), 'all', dataset_results)
+    _print_table('Results - Non-occ ({})'.format(dataset_display_name), 'nocc', dataset_results)
+    _print_table('Results - Occ ({})'.format(dataset_display_name), 'occ', dataset_results)
 
-        # # Plot (disabled: delete eval_plots/ to remove saved figures)
-        # plot_dir = os.path.join(save_dir, 'eval_plots', param)
-        # os.makedirs(plot_dir, exist_ok=True)
-        #
-        # fig, axes = plt.subplots(1, 3, figsize=(14, 4))
-        #
-        # axes[0].hist(l2_pixel, bins=50, alpha=0.7, edgecolor='black')
-        # axes[0].axvline(l2_pixel.mean(), color='red', linestyle='--',
-        #                 label='mean={:.2f}px'.format(l2_pixel.mean()))
-        # axes[0].set_xlabel('L2 error (pixel)')
-        # axes[0].set_ylabel('Count')
-        # axes[0].set_title('UV Error Distribution ({})'.format(ds_display))
-        # axes[0].legend()
-        # axes[0].grid(True, alpha=0.3)
-        #
-        # axes[1].scatter(gt_conf, conf_pred, s=2, alpha=0.3)
-        # axes[1].plot([0, 1], [0, 1], 'r--', alpha=0.5)
-        # axes[1].set_xlabel('Ground truth confidence')
-        # axes[1].set_ylabel('Predicted confidence')
-        # axes[1].set_title('Confidence Prediction ({})'.format(ds_display))
-        # axes[1].set_xlim(0, 1)
-        # axes[1].set_ylim(0, 1)
-        # axes[1].grid(True, alpha=0.3)
-        # axes[1].set_aspect('equal')
-        #
-        # visible_errs = l2_pixel[is_visible]
-        # occluded_errs = l2_pixel[is_occluded]
-        # if len(occluded_errs) > 0:
-        #     axes[2].hist(visible_errs, bins=40, alpha=0.6, label='visible', color='green')
-        #     axes[2].hist(occluded_errs, bins=40, alpha=0.6, label='occluded', color='red')
-        #     axes[2].set_xlabel('L2 error (pixel)')
-        #     axes[2].set_ylabel('Count')
-        #     axes[2].set_title('Error by Visibility ({})'.format(ds_display))
-        #     axes[2].legend()
-        # else:
-        #     axes[2].hist(l2_pixel, bins=40, alpha=0.7, edgecolor='black')
-        #     axes[2].set_xlabel('L2 error (pixel)')
-        #     axes[2].set_title('UV Error (no occlusion in {})'.format(ds_display))
-        # axes[2].grid(True, alpha=0.3)
-        #
-        # plt.tight_layout()
-        # plot_path = os.path.join(plot_dir, '{}_{}_uwb_eval.png'.format(ds_display.lower(), param))
-        # plt.savefig(plot_path, dpi=150)
-        # plt.close(fig)
-        # print('Plot saved: {}'.format(plot_path))
-
-    all_dataset_results[ds_display] = all_results
-
-# ============================================
-# Summary tables per dataset
-# ============================================
-def _fmt(val):
-    return '{:.6f}'.format(val)
-
-def _print_table(title, data_key, results):
     print()
-    print('{}:'.format(title))
-    header = '{:<22s}  {:>10s}  {:>10s}  {:>12s}  {:>9s}  {:>10s}  {:>10s}  {:>10s}  {:>10s}'.format(
-        'Tracker', 'uv_MSE', 'uv_RMSE', 'uv_MAE_px', 'In-box%', 'ConfMAE', 'ConfRMSE', 'ConfPear', 'ConfSpear')
-    print(header)
-    print('-' * len(header))
-    for display, m_all, m_occ, m_nonocc in results:
-        m = {'all': m_all, 'occ': m_occ, 'nocc': m_nonocc}[data_key]
+    print('Ranking on {} (by All/AUC desc, then All/uv_mae_pixel, then All/conf_mae):'.format(dataset_display_name))
+    for i, row in enumerate(dataset_results, 1):
+        m = row['all']
         if m is None:
-            print('{:<22s}  {:>10s}  {:>10s}  {:>12s}  {:>9s}  {:>10s}  {:>10s}  {:>10s}  {:>10s}'.format(
-                display, 'N/A', 'N/A', 'N/A', 'N/A', 'N/A', 'N/A', 'N/A', 'N/A'))
+            print('{}. {} | N/A'.format(i, row['tracker']))
         else:
-            print('{:<22s}  {:>10.6f}  {:>10.6f}  {:>12.6f}  {:>8.2f}%  {:>10.6f}  {:>10.6f}  {:>10.4f}  {:>10.4f}'.format(
-                display, m['uv_mse'], m['uv_rmse'], m['uv_mae_pixel'],
-                m['inbox_rate'] * 100,
-                m['conf_mae'], m['conf_rmse'], m['conf_pearson'], m['conf_spearman']))
+            print('{}. {} | uv_pred_auc={:.4f}, uv_mae_pixel={:.4f}, conf_mae={:.4f}, conf_spearman={:.4f}'.format(
+                i, row['tracker'], m['uv_pred_auc'], m['uv_mae_pixel'], m['conf_mae'], m['conf_spearman'])
+            )
 
-for ds_display in all_dataset_results:
+    return dataset_results, csv_rows
+
+
+if __name__ == '__main__':
+    os.makedirs(os.path.join(save_dir, 'analysis'), exist_ok=True)
+
+    all_csv_rows = []
+    overall_summary = {'MLP': [], 'GRU': [], 'TCN': []}
+
+    for dataset_name in dataset_names:
+        trackers = build_trackers(dataset_name)
+        dataset, dataset_display_name = get_uwb_dataset(dataset_name, split=split, seq_len=trackers[0]['seq_len'])
+
+        dataset_results, csv_rows = print_uwb_results(
+            trackers=trackers,
+            dataset=dataset,
+            dataset_name=dataset_name,                 # 小写，用于路径
+            dataset_display_name=dataset_display_name, # 大写，用于显示
+            split=split,
+            save_dir=save_dir
+        )
+
+        all_csv_rows.extend(csv_rows)
+
+        for row in dataset_results:
+            if row['all'] is not None:
+                overall_summary[row['tracker']].append(row['all'])
+
     print()
-    print('#' * 70)
-    print('#  Dataset: {}'.format(ds_display))
-    print('#' * 70)
-    _print_table('Results - All samples ({})'.format(ds_display), 'all', all_dataset_results[ds_display])
-    _print_table('Results - Non-occluded ({})'.format(ds_display), 'nocc', all_dataset_results[ds_display])
-    _print_table('Results - Occluded ({})'.format(ds_display), 'occ', all_dataset_results[ds_display])
+    print('=' * 80)
+    print('Overall ranking (mean over datasets, by AUC desc, then uv_mae_pixel, then conf_mae)')
+    print('=' * 80)
+
+    overall_rows = []
+    for tracker_name, metrics_list in overall_summary.items():
+        if not metrics_list:
+            continue
+        mean_auc = float(np.mean([m['uv_pred_auc'] for m in metrics_list]))
+        mean_uv = float(np.mean([m['uv_mae_pixel'] for m in metrics_list]))
+        mean_conf = float(np.mean([m['conf_mae'] for m in metrics_list]))
+        mean_spear = float(np.mean([m['conf_spearman'] for m in metrics_list]))
+        overall_rows.append((tracker_name, mean_auc, mean_uv, mean_conf, mean_spear))
+
+    overall_rows.sort(key=lambda x: (-x[1], x[2], x[3]))
+
+    for i, (tracker_name, mean_auc, mean_uv, mean_conf, mean_spear) in enumerate(overall_rows, 1):
+        print('{}. {} | mean_uv_pred_auc={:.4f}, mean_uv_mae_pixel={:.4f}, mean_conf_mae={:.4f}, mean_conf_spearman={:.4f}'.format(
+            i, tracker_name, mean_auc, mean_uv, mean_conf, mean_spear
+        ))
+
+    csv_path = os.path.join(save_dir, 'analysis', 'analysis_uwb_results_all_{}.csv'.format(split))
+    with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                'dataset', 'tracker', 'subset',
+                'uv_pred_auc', 'uv_l2_mean', 'uv_mse', 'uv_rmse', 'uv_mae_pixel',
+                'inrange_rate', 'conf_mae', 'conf_rmse', 'conf_pearson', 'conf_spearman'
+            ]
+        )
+        writer.writeheader()
+        writer.writerows(all_csv_rows)
+
+    print()
+    print('CSV saved to: {}'.format(csv_path))
